@@ -14,12 +14,14 @@
 
 import os
 import sys
+import copy
 import json
 import logging
 import requests
+from netaddr import IPAddress
 from calico_cni.util import print_cni_error
 from pycalico.datastore import DatastoreClient
-from pycalico.datastore_datatypes import Rule, Rules
+from pycalico.datastore_datatypes import Rule, Rules, Endpoint
 from pycalico.datastore_errors import MultipleEndpointsMatch
 from pycalico.util import validate_characters
 
@@ -33,6 +35,57 @@ import calico_cni.policy_parser
 
 # Use the same logger as calico_cni.
 _log = logging.getLogger("calico_cni")
+
+
+
+class KDEndpoint(Endpoint):
+    """Slightly patched Endpoint class with support for ipv4_nat field.
+    This field is needed to provide proper source IP for outgoing packets
+    from pods with public IP's.
+    """
+    def __init__(self, *args, **kwargs):
+        super(KDEndpoint, self).__init__(*args, **kwargs)
+        self.ipv4_nat = None
+
+    def to_json(self):
+        data = json.loads(super(KDEndpoint, self).to_json())
+        if self.ipv4_nat:
+            data['ipv4_nat'] = self.ipv4_nat
+        return json.dumps(data)
+
+    @classmethod
+    def from_endpoint(cls, ep):
+        """Creates KDEndpoint object from given Endpoint object
+        :param ep: object of class Endpoint
+        """
+        kd_ep = cls(ep.hostname, ep.orchestrator_id, ep.workload_id,
+                    ep.endpoint_id, ep.state, ep.mac, ep.name)
+        kd_ep.ipv4_nets = copy.deepcopy(ep.ipv4_nets)
+        kd_ep.ipv6_nets = copy.deepcopy(ep.ipv6_nets)
+        kd_ep.profile_ids = copy.deepcopy(ep.profile_ids)
+        kd_ep._original_json = ep._original_json
+        kd_ep.labels = copy.deepcopy(ep.labels)
+        kd_ep.process_labels()
+        return kd_ep
+
+    def process_labels(self):
+        if not self.labels:
+            self.ipv4_nat = None
+            return
+        kd_public_ip = self.labels.get('kuberdock-public-ip', None)
+        try:
+            # ensure ip address is valid
+            IPAddress(kd_public_ip)
+        except:
+            _log.info("Invalid kuberdock-public-ip: {}".format(kd_public_ip))
+            kd_public_ip = None
+        if kd_public_ip:
+            self.ipv4_nat = [
+                {"int_ip": str(ip_net.ip), "ext_ip": kd_public_ip}
+                for ip_net in self.ipv4_nets
+            ]
+        else:
+            self.ipv4_nat = None
 
 
 class DefaultPolicyDriver(object):
@@ -358,6 +411,10 @@ class KubernetesPolicyDriver(KubernetesAnnotationDriver):
         # Set profile
         profile_id = "k8s_ns.%s" % self.namespace
         _log.debug("Constructed profile ID - %s" % profile_id)
+
+        # replace endpoint with patched kuberdock version
+        endpoint = KDEndpoint.from_endpoint(endpoint)
+
         endpoint.profile_ids = [profile_id]
 
         # Fetch and set the labels
@@ -366,9 +423,13 @@ class KubernetesPolicyDriver(KubernetesAnnotationDriver):
         labels["calico/k8s_ns"] = self.namespace
         _log.debug("Got labels - %s" % labels)
         endpoint.labels = labels
+        endpoint.process_labels()
+        _log.info("KubernetesPolicyDriver.apply_profile pod: %s", pod)
 
         # Finally, update the endpoint.
         self._client.update_endpoint(endpoint)
+        _log.info("Original json After endpoint update: %s",
+                  endpoint._original_json)
 
     def remove_profile(self):
         # This policy driver didn't create any profiles so there are none to
